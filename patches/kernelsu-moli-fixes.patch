@@ -1,0 +1,330 @@
+diff --git a/kernel/hook/setuid_hook.c b/kernel/hook/setuid_hook.c
+index 1f1e91b..d024fb2 100644
+--- a/kernel/hook/setuid_hook.c
++++ b/kernel/hook/setuid_hook.c
+@@ -48,8 +48,11 @@ static int handle_zygote_setresuid(uid_t ruid) {
+     //   ksu manager.
+     // - Disable seccomp restriction for KSU manager since running with "su" will disable seccomp anyway
+     if (likely(ksu_is_manager_appid_valid()) && unlikely(is_uid_manager(ruid))) {
+-        disable_seccomp();
+-        pr_info("install fd for manager: %d\n", ruid);
++        /* MoLi: 不再对管理器禁用 seccomp —— 管理器会读自己的
++         * /proc/self/status 判断 seccomp 状态，一旦 disable_seccomp()
++         * 它永远显示"未启用"。内核 CONFIG_SECCOMP/FILTER 都是开着的。
++         */
++        pr_info("install fd for manager (seccomp kept): %d\n", ruid);
+         ksu_install_fd();
+         return 0;
+     }
+@@ -62,8 +65,12 @@ static int handle_zygote_setresuid(uid_t ruid) {
+         goto do_umount;
+     }
+ 
+-    // Disable seccomp restriction for root allowed apps since running with "su" will disable seccomp anyway
+-    if (ksu_is_allow_uid_for_current(ruid)) {
++    /* MoLi: 原来对所有"被允许"的 uid 都 disable_seccomp()，而 uid 0 / 系统进程
++     * 也被视为允许，结果 init、zygote64、surfaceflinger、audioserver 的 seccomp
++     * 全被剥掉（实测 /proc/<pid>/status 的 Seccomp 都是 0，只有 system_server 是 2），
++     * 管理器据此显示"seccomp 未启用"。只在「普通 App」上禁用，不动 root / 系统进程。
++     */
++    if (ksu_is_allow_uid_for_current(ruid) && is_appuid(ruid)) {
+         disable_seccomp();
+         return 0;
+     }
+@@ -98,8 +105,11 @@ static int handle_zygote_next_setresuid(uid_t ruid) {
+     //   ksu manager.
+     // - Disable seccomp restriction for KSU manager since running with "su" will disable seccomp anyway
+     if (likely(ksu_is_manager_appid_valid()) && unlikely(is_uid_manager(ruid))) {
+-        disable_seccomp();
+-        pr_info("install fd for manager: %d\n", ruid);
++        /* MoLi: 不再对管理器禁用 seccomp —— 管理器会读自己的
++         * /proc/self/status 判断 seccomp 状态，一旦 disable_seccomp()
++         * 它永远显示"未启用"。内核 CONFIG_SECCOMP/FILTER 都是开着的。
++         */
++        pr_info("install fd for manager (seccomp kept): %d\n", ruid);
+         ksu_install_fd();
+         return 0;
+     }
+@@ -113,8 +123,12 @@ static int handle_zygote_next_setresuid(uid_t ruid) {
+         goto do_susfs_work;
+     }
+ 
+-    // Disable seccomp restriction for root allowed apps since running with "su" will disable seccomp anyway
+-    if (ksu_is_allow_uid_for_current(ruid)) {
++    /* MoLi: 原来对所有"被允许"的 uid 都 disable_seccomp()，而 uid 0 / 系统进程
++     * 也被视为允许，结果 init、zygote64、surfaceflinger、audioserver 的 seccomp
++     * 全被剥掉（实测 /proc/<pid>/status 的 Seccomp 都是 0，只有 system_server 是 2），
++     * 管理器据此显示"seccomp 未启用"。只在「普通 App」上禁用，不动 root / 系统进程。
++     */
++    if (ksu_is_allow_uid_for_current(ruid) && is_appuid(ruid)) {
+         disable_seccomp();
+         return 0;
+     }
+diff --git a/kernel/manager/throne_tracker.c b/kernel/manager/throne_tracker.c
+index 26cb6f5..9f3ed96 100644
+--- a/kernel/manager/throne_tracker.c
++++ b/kernel/manager/throne_tracker.c
+@@ -450,7 +450,7 @@ void track_throne(bool prune_only)
+ 
+     if (need_rescan) {
+         // If the apk path still exists, the verification result won't be changed
+-        if (cached_manager_apk_path[0] && !ksu_manager_enabled()) {
++        if (0 && cached_manager_apk_path[0] && !ksu_manager_enabled()) { /* MoLi: 强制重扫，绕过缓存短路 */
+             struct path p;
+             int ret = kern_path(cached_manager_apk_path, 0, &p);
+             if (ret == 0) {
+diff --git a/kernel/policy/allowlist.c b/kernel/policy/allowlist.c
+index 82244b2..5df554d 100644
+--- a/kernel/policy/allowlist.c
++++ b/kernel/policy/allowlist.c
+@@ -69,14 +69,50 @@ struct perm_data {
+ static DEFINE_HASHTABLE(allow_list, ALLOW_LIST_BITS);
+ static u16 allow_list_count = 0;
+ 
+-/* MoLi: /data/adb 是 FBE 加密的，内核上下文（init/kworker 等）写它会返回 -ENOKEY，
+- * 导致授权名单永远无法落盘（重启后 App 的 root 授权丢失）。
+- * /metadata 分区未加密，KSU 自身的 modules.rc 也放在这儿，内核上下文可正常读写。*/
+-#define KERNEL_SU_ALLOWLIST "/metadata/ksu/.allowlist"
+-#define KERNEL_SU_ALLOWLIST_LEGACY "/data/adb/ksu/.allowlist"
++/* MoLi: 主路径用 /data/adb —— 不再依赖任何用户态模块去挂 /metadata。
++ * 内核写 FBE 加密的 /data 原本会 -ENOKEY(-126)，原因见 moli_fbe_creds()：
++ * override_creds(ksu_cred) 把 session keyring 也换掉了，FBE 密钥丢了。
++ * 现在保存/加载都用「保留 keyring、只提权 uid/caps」的 cred，所以能直接写 /data。
++ * /metadata/ksu/.allowlist 保留为回退（老用户的文件在那儿）。
++ */
++#define KERNEL_SU_ALLOWLIST "/data/adb/ksu/.allowlist"
++#define KERNEL_SU_ALLOWLIST_LEGACY "/metadata/ksu/.allowlist"
++
++/* MoLi: 是否成功加载过一次。为 false 时，su 请求路径会再尝试加载
++ * （那时是用户态进程上下文，能读 FBE 加密的 /data）。
++ */
++static bool allowlist_loaded_ok __read_mostly;
++
+ 
+ void ksu_persistent_allow_list(void);
+ 
++/* MoLi: FBE 修复 —— 内核上下文写 FBE 加密的 /data 会返回 -ENOKEY，
++ * 因为 override_creds(ksu_cred) 连 session keyring 一起换掉了，
++ * 而 fscrypt 的解密密钥就挂在 keyring 上。
++ * 这里克隆“调用者自己”的 cred（保留 keyring），只把 uid/gid/caps 提到 root。
++ * 返回 NULL 表示失败，调用方应回退到 ksu_cred。
++ */
++static const struct cred *moli_fbe_creds(void)
++{
++    struct cred *new;
++
++    new = prepare_creds();
++    if (!new)
++        return NULL;
++
++    new->uid = new->euid = new->suid = new->fsuid = GLOBAL_ROOT_UID;
++    new->gid = new->egid = new->sgid = new->fsgid = GLOBAL_ROOT_GID;
++
++    /* 直接抄 ksu_cred 的 cap 集合，避免依赖 cap_set_full 宏 */
++    new->cap_inheritable = ksu_cred->cap_inheritable;
++    new->cap_permitted = ksu_cred->cap_permitted;
++    new->cap_effective = ksu_cred->cap_effective;
++    new->cap_bset = ksu_cred->cap_bset;
++    new->cap_ambient = ksu_cred->cap_ambient;
++
++    return new;
++}
++
+ void ksu_show_allow_list(void)
+ {
+     int i;
+@@ -258,6 +294,11 @@ out_unlock:
+ 
+ bool __ksu_is_allow_uid(uid_t uid)
+ {
++    /* MoLi: 若开机时没能加载到 allowlist（例如 /data 当时还不可读），
++     * 这里补一次。此路径在用户态进程上下文里，可以读 FBE 加密的 /data。
++     * allowlist_loaded_ok 为真时直接返回，不产生任何开销。 */
++    ksu_allowlist_try_reload();
++
+     struct perm_data *p;
+ 
+     if (forbid_system_uid(uid)) {
+@@ -435,13 +476,24 @@ static int do_persistent_allow_list_body(void)
+     int i;
+ 
+     int ret = 0;
+-    const struct cred *saved = override_creds(ksu_cred);
+-    struct file *fp = filp_open(KERNEL_SU_ALLOWLIST, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++    const struct cred *use = moli_fbe_creds();
++
++    if (!use)
++        use = ksu_cred;
++    const struct cred *saved = override_creds(use);
++    struct file *fp = filp_open(KERNEL_SU_ALLOWLIST, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++    if (IS_ERR(fp)) {
++        long e = PTR_ERR(fp);
++
++        pr_err("MoLi save: primary failed %ld, try fallback\n", e);
++        fp = filp_open(KERNEL_SU_ALLOWLIST_LEGACY, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++    }
+     if (IS_ERR(fp)) {
+         pr_err("save_allow_list create file failed: %ld\n", PTR_ERR(fp));
+         ret = PTR_ERR(fp);
+         goto out;
+     }
++    pr_err("MoLi save: allowlist file opened ok\n");
+ 
+     // store magic and version
+     if (kernel_write(fp, &magic, sizeof(magic), &off) != sizeof(magic)) {
+@@ -540,6 +592,24 @@ static void migrate_profile(u32 version, struct app_profile *profile)
+     profile->version = KSU_APP_PROFILE_VER;
+ }
+ 
++/* MoLi: 若从未成功加载过 allowlist，再试一次。
++ * 由 su 请求路径调用；此时调用者已是用户态进程，可读 /data。
++ * 用计数器限制重试次数，避免文件真不存在时反复 filp_open。
++ */
++void ksu_allowlist_try_reload(void)
++{
++    static atomic_t retry = ATOMIC_INIT(0);
++
++    if (allowlist_loaded_ok)
++        return;
++    if (atomic_read(&retry) >= 8)
++        return;
++    atomic_inc(&retry);
++
++    pr_info("MoLi: allowlist retry load #%d\n", atomic_read(&retry));
++    ksu_load_allow_list();
++}
++
+ void ksu_load_allow_list()
+ {
+ #ifdef CONFIG_KSU_DISABLE_POLICY
+@@ -554,17 +624,23 @@ void ksu_load_allow_list()
+     u32 version;
+     size_t app_profile_size;
+ 
+-    // load allowlist now!（先新路径，再回退旧路径）
++    /* MoLi: 先主路径再回退；只要有一侧成功读到就置位 */
++    /* MoLi: 原来是 "-ENOENT 才回退"。但 FBE 未就绪时 filp_open 返回 -ENOKEY，
++     * 那样就永远不试回退路径，名单一直是空的。这里改成任何错误都回退。 */
+     fp = filp_open(KERNEL_SU_ALLOWLIST, O_RDONLY, 0);
+-    if (IS_ERR(fp) && PTR_ERR(fp) == -ENOENT) {
++    if (IS_ERR(fp)) {
++        long e1 = PTR_ERR(fp);
++
++        pr_err("MoLi allowlist: primary open failed %ld, trying fallback\n", e1);
+         fp = filp_open(KERNEL_SU_ALLOWLIST_LEGACY, O_RDONLY, 0);
+         if (!IS_ERR(fp))
+-            pr_info("load_allow_list: legacy path used\n");
++            pr_err("MoLi allowlist: fallback path used\n");
+     }
+     if (IS_ERR(fp)) {
+-        pr_info("load_allow_list open file failed: %ld (missing is normal on first boot)\n", PTR_ERR(fp));
++        pr_err("MoLi allowlist: BOTH paths failed %ld\n", PTR_ERR(fp));
+         return;
+     }
++    pr_err("MoLi allowlist: file opened ok\n");
+ 
+     // verify magic
+     if (kernel_read(fp, &magic, sizeof(magic), &off) != sizeof(magic) || magic != FILE_MAGIC) {
+@@ -583,7 +659,8 @@ void ksu_load_allow_list()
+         goto exit;
+     }
+ 
+-    pr_info("allowlist version: %d\n", version);
++    pr_err("MoLi allowlist: version=%d\n", version);
++    allowlist_loaded_ok = true; /* MoLi: 标记已成功加载 */
+ 
+     static const size_t kAppProfileSizePreV4 = 776;
+     app_profile_size = version < KSU_APP_PROFILE_VER ? kAppProfileSizePreV4 : sizeof(struct app_profile);
+@@ -601,7 +678,7 @@ void ksu_load_allow_list()
+ 
+         migrate_profile(version, &profile);
+ 
+-        pr_info("load_allow_uid, name: %s, uid: %d, allow: %d\n", profile.key, profile.curr_uid, profile.allow_su);
++        pr_err("MoLi allowlist entry: %s uid=%d allow=%d\n", profile.key, profile.curr_uid, profile.allow_su);
+         ksu_set_app_profile(&profile);
+     }
+     ksu_show_allow_list();
+diff --git a/kernel/policy/allowlist.h b/kernel/policy/allowlist.h
+index c1ea2b9..461cba0 100644
+--- a/kernel/policy/allowlist.h
++++ b/kernel/policy/allowlist.h
+@@ -17,6 +17,7 @@ void ksu_allowlist_init(void);
+ void ksu_allowlist_exit(void);
+ 
+ void ksu_load_allow_list(void);
++void ksu_allowlist_try_reload(void);
+ 
+ void ksu_show_allow_list(void);
+ 
+diff --git a/kernel/runtime/boot_event.c b/kernel/runtime/boot_event.c
+index cec611d..2abfadf 100644
+--- a/kernel/runtime/boot_event.c
++++ b/kernel/runtime/boot_event.c
+@@ -3,12 +3,15 @@
+ #include <linux/fs.h>
+ #include <linux/namei.h>
+ #include <linux/printk.h>
++#include <linux/workqueue.h>
++#include <linux/jiffies.h>
+ 
+ #include "policy/allowlist.h"
+ #include "policy/feature.h"
+ #include "klog.h" // IWYU pragma: keep
+ #include "runtime/ksud_boot.h"
+ #include "runtime/ksud.h"
++#include "manager/manager_identity.h"
+ #include "manager/manager_observer.h"
+ #include "manager/dynamic_manager.h"
+ #include "manager/throne_tracker.h"
+@@ -71,15 +74,51 @@ void on_module_mounted(void)
+     ksu_module_mounted = true;
+ }
+ 
++/* MoLi: 管理器加冕的内核侧重试。
++ * 本机开机早期 /data/app 的 FBE 密钥还不可见，签名校验返回 -ENOKEY，
++ * track_throne() 一次就失败 → 管理器显示"未安装"。
++ * 这里用延时工作队列在 FBE 解锁后重试若干次，不依赖任何用户态模块。
++ */
++static void moli_crown_work(struct work_struct *w);
++static DECLARE_DELAYED_WORK(moli_crown_wq, moli_crown_work);
++static int moli_crown_tries;
++
++static void moli_crown_work(struct work_struct *w)
++{
++    moli_crown_tries++;
++
++    if (ksu_is_manager_appid_valid()) {
++        pr_err("MoLi crown: manager already valid (try %d)\n", moli_crown_tries);
++        return;
++    }
++
++    pr_err("MoLi crown: try %d\n", moli_crown_tries);
++    track_throne(false);
++
++    if (!ksu_is_manager_appid_valid() && moli_crown_tries < 10)
++        schedule_delayed_work(&moli_crown_wq, 3 * HZ);
++    else
++        pr_err("MoLi crown: done, valid=%d tries=%d\n",
++               ksu_is_manager_appid_valid(), moli_crown_tries);
++}
++
+ void on_boot_completed(void)
+ {
+     ksu_boot_completed = true;
+     pr_info("on_boot_completed!\n");
++
++    /* MoLi: 开机早期（post-fs-data）内核上下文读 FBE 加密的 /data 会返回 -ENOKEY，
++     * 那时加载 allowlist / 校验管理器 APK 都会失败（实测 is_manager: 0）。
++     * 到 boot_completed 时 FBE 已解锁、/data 可正常读，这里再加载一次。
++     */
++    ksu_load_allow_list();
+     // MoLi: 开机完成时做一次完整的管理器扫描（track_throne(false)）。
+     // 上游此处传的 prune_only=true 会直接 goto prune，跳过管理器识别；
+     // 而识别原本只依赖 packages.list 的 create/move 事件，在部分 ROM（本机 NOH-AN01）
+     // 开机时并不触发，导致管理器不被"加冕"、UI 显示"未安装"。
+     // 此处改为完整扫描：开机完成时 /data/system/packages.list 必然已就绪，识别是确定性的。
+     track_throne(false);
++    /* MoLi: 立刻这次很可能仍 -ENOKEY，再排一个延时重试序列 */
++    schedule_delayed_work(&moli_crown_wq, 3 * HZ);
+     ksu_selinux_hide_drop_backup_if_unused();
+ }
